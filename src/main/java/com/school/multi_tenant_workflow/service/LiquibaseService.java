@@ -12,114 +12,119 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
+/**
+ * Service responsible for the physical creation of tenant databases
+ * and executing Liquibase schema migrations across MySQL and PostgreSQL.
+ */
 @Service
 public class LiquibaseService {
 
     private static final Logger log = LoggerFactory.getLogger(LiquibaseService.class);
-
     private static final String CHANGELOG_FILE = "db/changelog/master.xml";
 
-    /**
-     * Provisions a new tenant database:
-     *  1. Creates the database if it doesn't exist
-     *  2. Applies Liquibase migrations (changelog)
-     *
-     * @param url        JDBC URL including database name (e.g. jdbc:mysql://localhost:3306/tenant_school_a)
-     * @param username   DB user (must have CREATE DATABASE privilege for step 1)
-     * @param password   DB password
-     * @param driverClass JDBC driver class name
-     */
     public void runMigration(String url, String username, String password, String driverClass) {
-        if (url == null || url.trim().isEmpty()) {
-            throw new IllegalArgumentException("JDBC URL cannot be empty");
-        }
+        try {
+            String dbName = extractDatabaseName(url);
+            String serverUrl = extractServerUrl(url, driverClass);
 
-        // Extract base URL (without DB name) and database name
-        int lastSlashIndex = url.lastIndexOf('/');
-        if (lastSlashIndex == -1 || lastSlashIndex == url.length() - 1) {
-            throw new IllegalArgumentException("Invalid JDBC URL format - missing database name: " + url);
-        }
+            log.info("Starting automated provisioning for: {} using driver: {}", dbName, driverClass);
 
-        String baseUrl = url.substring(0, lastSlashIndex + 1);
-        String dbName = url.substring(lastSlashIndex + 1);
+            // ────────────────────────────────────────────────────────────────
+            // Step 1: Automated Database Creation (The Container)
+            // ────────────────────────────────────────────────────────────────
+            // We connect to the "Server Root" to run CREATE DATABASE
+            try (HikariDataSource rootDs = createTemporaryDataSource(serverUrl, driverClass, username, password);
+                 Connection rootConn = rootDs.getConnection();
+                 Statement stmt = rootConn.createStatement()) {
 
-        log.info("Starting tenant provisioning for database: {}", dbName);
+                if (isPostgres(driverClass)) {
+                    createPostgresDatabase(rootConn, stmt, dbName);
+                } else {
+                    createMySQLDatabase(stmt, dbName);
+                }
+            }
 
-        // ────────────────────────────────────────────────────────────────
-        // Step 1: Create database if not exists (connect to server root)
-        // ────────────────────────────────────────────────────────────────
-        HikariDataSource rootDataSource = createShortLivedDataSource(
-                baseUrl + "?allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC",
-                driverClass, username, password);
+            // ────────────────────────────────────────────────────────────────
+            // Step 2: Liquibase Schema Migration (The Tables)
+            // ────────────────────────────────────────────────────────────────
+            // Now we connect to the newly created specific database
+            try (HikariDataSource tenantDs = createTemporaryDataSource(url, driverClass, username, password);
+                 Connection conn = tenantDs.getConnection()) {
 
-        try (Connection rootConnection = rootDataSource.getConnection();
-             Statement stmt = rootConnection.createStatement()) {
+                Database database = DatabaseFactory.getInstance()
+                        .findCorrectDatabaseImplementation(new JdbcConnection(conn));
 
-            String sql = "CREATE DATABASE IF NOT EXISTS `" + dbName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
-            stmt.executeUpdate(sql);
-            log.info("Database '{}' checked / created successfully", dbName);
+                Liquibase liquibase = new Liquibase(CHANGELOG_FILE, new ClassLoaderResourceAccessor(), database);
 
-        } catch (SQLException e) {
-            log.error("Failed to create database '{}'", dbName, e);
-            throw new RuntimeException("Could not create database '" + dbName + "': " + e.getMessage(), e);
-        } finally {
-            rootDataSource.close();
-        }
+                log.info("Running Liquibase migration on: {}", url);
+                liquibase.update("");
+                log.info("Successfully provisioned tenant: {}", dbName);
+            }
 
-        // ────────────────────────────────────────────────────────────────
-        // Step 2: Run Liquibase migrations on the target database
-        // ────────────────────────────────────────────────────────────────
-        HikariDataSource tenantDataSource = createShortLivedDataSource(
-                url, driverClass, username, password);
-
-        try (Connection connection = tenantDataSource.getConnection()) {
-
-            Database database = DatabaseFactory.getInstance()
-                    .findCorrectDatabaseImplementation(new JdbcConnection(connection));
-
-            Liquibase liquibase = new Liquibase(
-                    CHANGELOG_FILE,
-                    new ClassLoaderResourceAccessor(),
-                    database
-            );
-
-            log.info("Applying Liquibase changelog: {} to {}", CHANGELOG_FILE, url);
-            liquibase.update("");
-
-            log.info("Tenant database provisioning completed successfully: {}", url);
-
-        } catch (LiquibaseException | SQLException e) {
-            log.error("Liquibase migration failed for {}", url, e);
-            throw new RuntimeException("Migration failed for " + url + ": " + e.getMessage(), e);
-        } finally {
-            tenantDataSource.close();
+        } catch (Exception e) {
+            log.error("Provisioning failed for {}: {}", url, e.getMessage());
+            throw new RuntimeException("Automation Error: " + e.getMessage(), e);
         }
     }
 
-    /**
-     * Creates a short-lived HikariDataSource (not pooled long-term)
-     */
-    private HikariDataSource createShortLivedDataSource(String jdbcUrl, String driverClass,
-                                                        String username, String password) {
+    private void createMySQLDatabase(Statement stmt, String dbName) throws SQLException {
+        // MySQL allows "IF NOT EXISTS"
+        String sql = "CREATE DATABASE IF NOT EXISTS `" + dbName + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
+        stmt.executeUpdate(sql);
+        log.info("MySQL database '{}' is ready.", dbName);
+    }
+
+    private void createPostgresDatabase(Connection conn, Statement stmt, String dbName) throws SQLException {
+        // PostgreSQL requires manual check as it doesn't support "IF NOT EXISTS" for databases
+        ResultSet rs = conn.getMetaData().getCatalogs();
+        boolean exists = false;
+        while (rs.next()) {
+            if (rs.getString(1).equalsIgnoreCase(dbName)) {
+                exists = true;
+                break;
+            }
+        }
+        rs.close();
+
+        if (!exists) {
+            // Note: PostgreSQL does not allow CREATE DATABASE inside a transaction
+            stmt.executeUpdate("CREATE DATABASE " + dbName);
+            log.info("PostgreSQL database '{}' created successfully.", dbName);
+        } else {
+            log.info("PostgreSQL database '{}' already exists.", dbName);
+        }
+    }
+
+    private HikariDataSource createTemporaryDataSource(String url, String driver, String user, String pass) {
         HikariDataSource ds = new HikariDataSource();
-        ds.setJdbcUrl(jdbcUrl);
-        ds.setDriverClassName(driverClass);
-        ds.setUsername(username);
-        ds.setPassword(password);
+        ds.setJdbcUrl(url);
+        ds.setDriverClassName(driver);
+        ds.setUsername(user);
+        ds.setPassword(pass);
 
-        // Short-lived pool settings (we close it right after use)
-        ds.setMaximumPoolSize(2);
-        ds.setMinimumIdle(0);
-        ds.setIdleTimeout(10000);         // 10 seconds
-        ds.setMaxLifetime(60000);         // 1 minute
-        ds.setConnectionTimeout(8000);    // 8 seconds
-
-        // MySQL validation query
-        ds.setConnectionTestQuery("SELECT 1");
-
+        // Use a tiny, short-lived pool for the automation task
+        ds.setMaximumPoolSize(1);
+        ds.setConnectionTimeout(10000);
         return ds;
+    }
+
+    private String extractDatabaseName(String url) {
+        // Handles trailing slashes or parameters in the URL
+        String path = url.split("\\?")[0];
+        return path.substring(path.lastIndexOf("/") + 1);
+    }
+
+    private String extractServerUrl(String url, String driver) {
+        String base = url.substring(0, url.lastIndexOf("/") + 1);
+        // This is the key: Postgres needs the 'postgres' db for admin tasks
+        return driver.contains("postgresql") ? base + "postgres" : base;
+    }
+
+    private boolean isPostgres(String driver) {
+        return driver != null && driver.toLowerCase().contains("postgresql");
     }
 }
