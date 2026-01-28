@@ -5,7 +5,6 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
-import org.springframework.jdbc.datasource.lookup.AbstractRoutingDataSource;
 
 import javax.sql.DataSource;
 import java.util.HashMap;
@@ -18,25 +17,29 @@ public class DataSourceConfiguration {
     public DataSource masterDataSource() {
         HikariDataSource ds = new HikariDataSource();
         ds.setDriverClassName("com.mysql.cj.jdbc.Driver");
-        // Ensure this URL matches your local MySQL setup
+
+        // Connects to your Master MySQL Registry
         ds.setJdbcUrl("jdbc:mysql://localhost:3306/master_control_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC");
         ds.setUsername("root");
-        ds.setPassword("mysql"); // <-- Change to your actual password
+        ds.setPassword("mysql"); // Restored your original password
 
+        // Basic pool settings for the Registry
         ds.setMaximumPoolSize(10);
+        ds.setPoolName("MasterDB-Pool");
+
         return ds;
     }
 
     @Bean
     @Primary
     public DataSource dataSource(@Qualifier("masterDataSource") DataSource masterDataSource) {
-        // Use the class in the same package
+        // This is your "Traffic Cop" that switches between school databases
         TenantRoutingDataSource routingDataSource = new TenantRoutingDataSource();
 
         Map<Object, Object> targetDataSources = new HashMap<>();
         routingDataSource.setTargetDataSources(targetDataSources);
 
-        // Fallback to Master DB so Hibernate doesn't crash at startup
+        // CRITICAL: Fallback to Master DB so Hibernate doesn't crash at startup
         routingDataSource.setDefaultTargetDataSource(masterDataSource);
 
         routingDataSource.afterPropertiesSet();
